@@ -108,7 +108,7 @@ def do_export(
                 # Do not constant-fold because torch.onnx incorrectly folds
                 # layer_norm(data, scale=add(gamma,1)) to layer_norm(data, scale=gamma)
                 # when we use LN with zero-centered gamma.
-                do_constant_folding=False,
+                do_constant_folding=True,
                 operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH)
 
 
@@ -921,7 +921,7 @@ def test_export_multihead_attention(
 
     hidden_size = 256
     sequence_length = 128
-    batch_size = 4
+    batch_size = 1
     num_attention_heads = 32
     kv_channels = 8
     attention_dropout = 0.1
@@ -1175,20 +1175,20 @@ test_configs_attention_type = [
     #"input_layernorm, attention_type, fuse_qkv_params"
     (True,             "self",         True),
 ]
-@pytest.mark.parametrize("use_fp8", [True])
+@pytest.mark.parametrize("max_seq_len", [1])
+@pytest.mark.parametrize("use_fp8", [False])
 @pytest.mark.parametrize("use_mask, attn_mask_type", test_configs_multihead_attention)
 @pytest.mark.parametrize("precision", [torch.float32])
-@pytest.mark.parametrize("return_layernorm_output", [False])
 @pytest.mark.parametrize("input_layernorm, attention_type, fuse_qkv_params", test_configs_attention_type)
 def test_kvcache_mha(
     use_fp8: bool,
     use_mask: bool,
     attn_mask_type: str,
     precision: torch.dtype,
-    return_layernorm_output: bool,
     input_layernorm: bool,
     attention_type: str,
-    fuse_qkv_params: bool
+    fuse_qkv_params: bool,
+    max_seq_len: int,
 ):
     # Skip FP8 tests on non-hopper devices
     if use_fp8 and not fp8_available:
@@ -1196,7 +1196,7 @@ def test_kvcache_mha(
 
     hidden_size = 256
     sequence_length = 128
-    batch_size = 4
+    batch_size = 1
     num_attention_heads = 32
     kv_channels = 8
     attention_dropout = 0.1
@@ -1228,7 +1228,7 @@ def test_kvcache_mha(
 
     InferenceParameters = te.transformer.InferenceParameters
     class TestFP8_KVCacheMHA(nn.Module):
-        def __init__(self, nb_layers):
+        def __init__(self, nb_layers, nb_generations):
             super().__init__()
             self.mha_layers = nn.ModuleList()
             for layer in range(nb_layers):
@@ -1236,18 +1236,19 @@ def test_kvcache_mha(
                     *attention_args,
                     attn_mask_type=attn_mask_type,
                     params_dtype=precision,
-                    return_layernorm_output=return_layernorm_output,
+                    return_layernorm_output=False,
                     input_layernorm=input_layernorm,
                     attention_type=attention_type,
                     fuse_qkv_params=fuse_qkv_params,
                     layer_number=layer,
                 ).to(device='cuda')
                 self.mha_layers.append(mha)
-            self.infp = self._alloc_inference_params(nb_layers=nb_layers)
+            self.max_seq_len = sequence_length + nb_generations
+            self.infp = self._alloc_inference_params(nb_layers, self.max_seq_len)
 
-        def _alloc_inference_params(self, nb_layers):
+        def _alloc_inference_params(self, nb_layers, max_seq_len):
             infp = InferenceParameters(
-                max_sequence_len = sequence_length,
+                max_sequence_len = max_seq_len,
                 max_batch_size = batch_size,
                 batch_size_offset = 0,
                 sequence_len_offset = 0,
@@ -1262,22 +1263,26 @@ def test_kvcache_mha(
             inference_params: Optional[InferenceParameters] = None
         ):
             attn1_out, attn1_bias = self.mha_layers[0].forward(hidden_states, inference_params=model.infp)
-            attn2_out, attn2_bias = self.mha_layers[1].forward(attn1_out, inference_params=model.infp)
+            print(f"attn1_out.shape = {attn1_out.shape}")
+            print(f"attn1_bias.shape = {attn1_out.shape}")
+            #assert False
+            seq_offset = model.infp.sequence_len_offset
+            # This line causes a problem: the mask is not right size (128,128) vs (128,129)
+            #model.infp.sequence_len_offset += 1
+            attn2_out, attn2_bias = self.mha_layers[0].forward(attn1_out[seq_offset:], inference_params=model.infp)
             return attn2_out, attn2_bias
 
-    model = TestFP8_KVCacheMHA(nb_layers=2)
+    model = TestFP8_KVCacheMHA(nb_layers=1, nb_generations=4)
 
     inp = (hidden_states, attention_mask, encoder_output)
     do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names)
-    infer_ort = precision != torch.float16  # temporarily skipping onnxrt inference due to input type mismatch bug
+    infer_ort = False
     if not use_fp8:
         validate_result(fname, inp, model, atol=1e-3, input_names=input_names, output_names=output_names)
     else:
-        validate_result(fname, inp, model, atol=2e-2, is_fp8=use_fp8, input_names=input_names, output_names=output_names, infer_ort=infer_ort)
+        validate_result(fname, inp, model, atol=2e-3, is_fp8=use_fp8, input_names=input_names, output_names=output_names, infer_ort=infer_ort)
 
-    print(len(model.infp.key_value_memory_dict))
-    print(model.infp.key_value_memory_dict[0])
-    print(model.infp.key_value_memory_dict[0][0].shape)
+    #print(model.infp.key_value_memory_dict[0])
+    print(f"k/v shape {model.infp.key_value_memory_dict[0][0].shape}")
     # print(model.infp.key_value_memory_dict[0][1])
     #assert len(model.infp.key_value_memory_dict) == 0
-

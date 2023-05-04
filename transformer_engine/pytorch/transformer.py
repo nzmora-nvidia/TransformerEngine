@@ -792,7 +792,7 @@ class MultiHeadAttention(torch.nn.Module):
                 inference_value_memory = self._allocate_memory(
                     inf_max_seq_len, inf_max_batch_size
                 )
-                print(f"here layer={self.layer_number}")
+                print(f"preallocate kv cache for layer={self.layer_number}")
                 inference_params.key_value_memory_dict[self.layer_number] = (
                     inference_key_memory,
                     inference_value_memory,
@@ -912,11 +912,13 @@ class MultiHeadAttention(torch.nn.Module):
         if inference_params and self.layer_number is not None:
             batch_start = inference_params.batch_size_offset
             batch_end = batch_start + key_layer.size(1)
+            print(f"batch_start={batch_start}  batch_end={batch_end}")
+            print(f"BS = {inference_key_memory.size(1)}")
             assert batch_end <= inference_key_memory.size(1)
             sequence_start = inference_params.sequence_len_offset
             sequence_end = sequence_start + key_layer.size(0)
-            print(inference_key_memory.size(0))
-            print(sequence_end)
+            print(f"K,V shape {inference_key_memory.shape}")
+            print(f"sequence_end = {sequence_end}")
             assert sequence_end <= inference_key_memory.size(0)
             # Copy key and values.
             inference_key_memory[
