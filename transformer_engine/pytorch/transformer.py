@@ -10,7 +10,7 @@ from importlib.metadata import version
 from contextlib import nullcontext
 from typing import Any, Callable, Optional, Tuple, Union
 from pkg_resources import packaging
-
+from dataclasses import dataclass
 import torch
 
 from flash_attn.flash_attn_interface import flash_attn_unpadded_func
@@ -51,6 +51,16 @@ warnings.filterwarnings("module", category=DeprecationWarning, module="transform
 
 
 __all__ = ["DotProductAttention", "TransformerLayer"]
+
+
+@dataclass
+class InferenceParameters:
+    """A class containing inference configuration parameters"""
+    max_sequence_len: int       # Used when allocating the KV memory
+    max_batch_size: int         # Used when allocating the KV memory
+    batch_size_offset: int      # Start of slice on batch dimension; used when copying into the cache
+    sequence_len_offset: int    # Start of slice on sequence dimension; used when copying into the cache
+    key_value_memory_dict: list # List of (K, V) pairs
 
 
 class DropPath(torch.nn.Module):
@@ -604,7 +614,7 @@ class MultiHeadAttention(torch.nn.Module):
         bias: bool = True,
     ) -> None:
         super().__init__()
-        self.layer_number = (layer_number,)
+        self.layer_number = layer_number
         self.input_layernorm = input_layernorm
         self.attention_type = attention_type
         self.get_rng_state_tracker = get_rng_state_tracker
@@ -773,6 +783,7 @@ class MultiHeadAttention(torch.nn.Module):
 
         if inference_params and self.layer_number is not None:
             if self.layer_number not in inference_params.key_value_memory_dict:
+                # assert 1 > 2
                 inf_max_seq_len = inference_params.max_sequence_len
                 inf_max_batch_size = inference_params.max_batch_size
                 inference_key_memory = self._allocate_memory(
@@ -781,6 +792,7 @@ class MultiHeadAttention(torch.nn.Module):
                 inference_value_memory = self._allocate_memory(
                     inf_max_seq_len, inf_max_batch_size
                 )
+                print(f"here layer={self.layer_number}")
                 inference_params.key_value_memory_dict[self.layer_number] = (
                     inference_key_memory,
                     inference_value_memory,
@@ -903,6 +915,8 @@ class MultiHeadAttention(torch.nn.Module):
             assert batch_end <= inference_key_memory.size(1)
             sequence_start = inference_params.sequence_len_offset
             sequence_end = sequence_start + key_layer.size(0)
+            print(inference_key_memory.size(0))
+            print(sequence_end)
             assert sequence_end <= inference_key_memory.size(0)
             # Copy key and values.
             inference_key_memory[
