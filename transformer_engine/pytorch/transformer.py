@@ -182,6 +182,8 @@ class UnfusedDotProductAttention(torch.nn.Module):
             key_layer.size(0),
         )
 
+        print(f"UnfusedDotProductAttention - attention_mask = {attention_mask}")
+
         # [sq, b, np, hn] -> [sq, b * np, hn]
         query_layer = query_layer.reshape(
             output_size[2], output_size[0] * output_size[1], -1
@@ -575,6 +577,7 @@ class DotProductAttention(torch.nn.Module):
                 value_layer,
                 attention_mask,
             )
+        print(f"DotProductAttention - attention_mask = {attention_mask}")
         return self.unfused_attention(query_layer, key_layer, value_layer, attention_mask)
 
 

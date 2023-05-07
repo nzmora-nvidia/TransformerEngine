@@ -19,6 +19,8 @@ def attention_mask_func(
     attention_scores: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
     """Get attention mask"""
+    print(f"attention_mask {attention_mask.shape}")
+    print(f"attention_scores {attention_scores.shape}")
     attention_scores.masked_fill_(attention_mask, -10000.0)
     return attention_scores
 

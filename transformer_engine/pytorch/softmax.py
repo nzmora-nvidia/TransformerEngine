@@ -233,6 +233,7 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         if self.is_kernel_available(*inp.size()):
             return self.forward_fused_softmax(inp, mask, scale)
+        print(f"FusedScaleMaskSoftmax - mask = {mask}")
         return self.forward_torch_softmax(inp, mask, scale)
 
     def is_kernel_available(self, b: int, np: int, sq: int, sk: int) -> bool:
@@ -287,6 +288,7 @@ class FusedScaleMaskSoftmax(nn.Module):
             inp = inp * scale
 
         if self.attn_mask_type == "causal":
+            print(f"inp = {inp.shape}")
             mask = _get_default_causal_mask(inp.size()[2])
 
         mask_output = self.mask_func(inp, mask) if mask is not None else inp

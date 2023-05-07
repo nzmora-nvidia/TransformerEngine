@@ -127,7 +127,12 @@ def set_layer_scale(module: torch.nn.Module, scale: float, num_gemms: int):
         nb_total_scales, dtype=torch.float32, device="cuda") * scale
 
 
-def te_infer(model: torch.nn.Module, inps: Union[Tuple[torch.tensor], torch.tensor], is_fp8: bool):
+def te_infer(
+    model: torch.nn.Module,
+    inps: Union[Tuple[torch.tensor],
+    torch.tensor],
+    is_fp8: bool
+) -> np.ndarray:
     """Transformer Engine forward prpoagtation.
 
     Return results after copying to the CPU and converting to numpy.
@@ -153,7 +158,7 @@ def validate_result(
     input_names: list=["input"],
     output_names: list=["output"],
     infer_ort=True
-):
+) -> Tuple[np.ndarray, np.ndarray]:
     """Compare the outputs of a Transformer Engine (TE) module vs the outputs of its ONNX
     representation using ONNX Runtime (ORT) and ensure they are close.
 
@@ -254,6 +259,7 @@ def validate_result(
         onnx_outputs = ort_s.run(None, input_feed=input_feed)
         compare_outputs(onnx_outputs, te_outputs)
     serialize_inputs_outputs(fname, inps, input_names, te_outputs, output_names)
+    return te_outputs, onnx_outputs
 
 
 def create_meta(scale_factor: float, size: int=1):
@@ -1169,7 +1175,8 @@ def test_export_ctx_manager(enabled):
 
 test_configs_multihead_attention = [
     #"use_mask, attn_mask_type"
-    (False,    "causal"),  # calls ScaledUpperTriangMaskedSoftmax
+    #(False,    "causal"),  # calls ScaledUpperTriangMaskedSoftmax
+    (False,    "padding"),
 ]
 test_configs_attention_type = [
     #"input_layernorm, attention_type, fuse_qkv_params"
@@ -1211,8 +1218,6 @@ def test_kvcache_mha(
         init_method,
         output_layer_init_method,
     )
-    hidden_states = torch.randn(sequence_length, batch_size, hidden_size, dtype=precision, device="cuda")
-
     attention_mask = None
     encoder_output = None
     input_names = ["hidden_states", "attention_mask", "encoder_output"]
@@ -1224,7 +1229,7 @@ def test_kvcache_mha(
     fuse_qkv_str = "_fused-qkv" if fuse_qkv_params else ""
     attn_mask_str = get_attn_mask_str(use_mask, attn_mask_type)
     input_ln_str = "_input-ln" if input_layernorm else ""
-    fname = f"kvcache_mha{fp8_str}{attn_mask_str}{attn_type_str}{input_ln_str}{fuse_qkv_str}{dtype_str}.onnx"
+    fname_prefix = f"kvcache_mha{fp8_str}{attn_mask_str}{attn_type_str}{input_ln_str}{fuse_qkv_str}{dtype_str}"
 
     InferenceParameters = te.transformer.InferenceParameters
     class TestFP8_KVCacheMHA(nn.Module):
@@ -1244,9 +1249,10 @@ def test_kvcache_mha(
                 ).to(device='cuda')
                 self.mha_layers.append(mha)
             self.max_seq_len = sequence_length + nb_generations
-            self.infp = self._alloc_inference_params(nb_layers, self.max_seq_len)
+            self.infp = self._create_inference_params(nb_layers, self.max_seq_len)
+            self.use_cache = None
 
-        def _alloc_inference_params(self, nb_layers, max_seq_len):
+        def _create_inference_params(self, nb_layers, max_seq_len):
             infp = InferenceParameters(
                 max_sequence_len = max_seq_len,
                 max_batch_size = batch_size,
@@ -1262,27 +1268,87 @@ def test_kvcache_mha(
             encoder_output: Optional[torch.Tensor] = None,
             inference_params: Optional[InferenceParameters] = None
         ):
-            attn1_out, attn1_bias = self.mha_layers[0].forward(hidden_states, inference_params=model.infp)
+            assert self.use_cache is not None # Make sure cache usage was configured explicitly
+            if self.use_cache:
+                attn1_out, attn1_bias = self.mha_layers[0].forward(hidden_states, inference_params=self.infp)
+            else:
+                attn1_out, attn1_bias = self.mha_layers[0].forward(hidden_states)
             print(f"attn1_out.shape = {attn1_out.shape}")
             print(f"attn1_bias.shape = {attn1_out.shape}")
             #assert False
-            seq_offset = model.infp.sequence_len_offset
-            # This line causes a problem: the mask is not right size (128,128) vs (128,129)
-            #model.infp.sequence_len_offset += 1
-            attn2_out, attn2_bias = self.mha_layers[0].forward(attn1_out[seq_offset:], inference_params=model.infp)
-            return attn2_out, attn2_bias
+            # seq_offset = model.infp.sequence_len_offset
+            # # This line causes a problem: the mask is not right size (128,128) vs (128,129)
+            # model.infp.sequence_len_offset += 1
+            # attn2_out, attn2_bias = self.mha_layers[1].forward(attn1_out[seq_offset:], inference_params=model.infp)
+            return attn1_out, attn1_bias
 
-    model = TestFP8_KVCacheMHA(nb_layers=1, nb_generations=4)
+    def run_test_uncached(model, hidden_states, nb_generations):
+        model.use_cache = False
+        outputs = []
+        for i in range(nb_generations):
+            print(f"hidden_states@{i} {hidden_states.shape}")
+            # model = TestFP8_KVCacheMHA(nb_layers=2, nb_generations=4)
+            fname = f"{fname_prefix}_uncached_{i}.onnx"
+            inp = (hidden_states, attention_mask, encoder_output)
+            #assert i < 1
+            do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names)
+            infer_ort = True
+            if not use_fp8:
+                te_outputs, onnx_outputs = validate_result(
+                        fname, inp, model, atol=1e-3, input_names=input_names, output_names=output_names)
+            else:
+                te_outputs, onnx_outputs = validate_result(
+                        fname, inp, model, atol=2e-3, is_fp8=use_fp8, input_names=input_names,
+                        output_names=output_names, infer_ort=infer_ort)
+            ref_outputs = te_outputs[0]
+            outputs.append(ref_outputs)
+            new_hidden_state = ref_outputs[sequence_length+i-1:,:,:]
+            print(f"ref_outputs@{i}-a {ref_outputs.shape} {new_hidden_state.shape}")
+            hidden_states = torch.cat(
+                    (hidden_states, torch.from_numpy(new_hidden_state).to('cuda')),
+                    axis=0)
+            print(f"hidden_states@{i} {hidden_states.shape}")
+            #assert False
+        return outputs
 
-    inp = (hidden_states, attention_mask, encoder_output)
-    do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names)
-    infer_ort = False
-    if not use_fp8:
-        validate_result(fname, inp, model, atol=1e-3, input_names=input_names, output_names=output_names)
-    else:
-        validate_result(fname, inp, model, atol=2e-3, is_fp8=use_fp8, input_names=input_names, output_names=output_names, infer_ort=infer_ort)
+    def run_test_cached(model, hidden_states, nb_generations):
+        model.use_cache = True
+        outputs = []
+        for i in range(nb_generations):
+            print(f"hidden_states@{i} {hidden_states.shape}")
+            fname = f"{fname_prefix}_cached_{i}.onnx"
+            inp = (hidden_states, attention_mask, encoder_output)
+            #assert i < 1
+            do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names)
+            infer_ort = True
+            if not use_fp8:
+                te_outputs, onnx_outputs = validate_result(fname, inp, model, atol=1e-3, input_names=input_names, output_names=output_names)
+            else:
+                te_outputs, onnx_outputs = validate_result(fname, inp, model, atol=2e-3, is_fp8=use_fp8, input_names=input_names, output_names=output_names, infer_ort=infer_ort)
+            model.infp.sequence_len_offset += hidden_states.size(0) # Seq dimension
+            seq_offset = model.infp.sequence_len_offset - 1
+            ref_outputs = te_outputs[0]
+            outputs.append(ref_outputs)
+            # print(f"te_outputs@{i}-a {te_outputs[0].shape}")
+            hidden_states = torch.from_numpy(te_outputs[0][seq_offset:,]).to('cuda')
+        return outputs
 
-    #print(model.infp.key_value_memory_dict[0])
-    print(f"k/v shape {model.infp.key_value_memory_dict[0][0].shape}")
-    # print(model.infp.key_value_memory_dict[0][1])
-    #assert len(model.infp.key_value_memory_dict) == 0
+    nb_generations = 2
+    model = TestFP8_KVCacheMHA(nb_layers=2, nb_generations=nb_generations)
+    hidden_states = torch.randn(sequence_length, batch_size, hidden_size, dtype=precision, device="cuda")
+    o1_uc, o2_uc = run_test_uncached(model, hidden_states, nb_generations)
+    o1_c, o2_c = run_test_cached(model, hidden_states, nb_generations)
+    print(f"shapes uc = {o1_uc.shape} {o2_uc.shape}")
+    print(f"shapes c = {o1_c.shape} {o2_c.shape}")
+
+    def compare(uc, c, atol):
+        # assert False
+        isclose = ~np.isclose(uc, c, atol=atol)
+        mismatches = isclose.nonzero()
+        mismatched_ids = [loc for loc in zip(*mismatches)]
+        if mismatched_ids:
+            print(uc[0], c[0])
+            print(f"mismatched_ids = {len(mismatched_ids)}")
+            assert False
+    compare(o1_uc, o1_c, atol=0)
+    compare(o2_uc[128,], o2_c, atol=1e-3)
