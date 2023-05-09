@@ -9,6 +9,7 @@ import torch
 from torch import nn
 import torch._C._onnx as _C_onnx
 from torch.onnx import _type_utils
+from transformer_engine.pytorch.export import is_in_onnx_export_mode
 
 import transformer_engine_extensions as tex
 
@@ -24,6 +25,15 @@ def _get_default_causal_mask(sq: int) -> torch.Tensor:
         _default_causal_mask[sq] = torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
     return _default_causal_mask[sq]
 
+
+def _get_onnx_export_causal_mask(seq_q: int, seq_k: int, onnx_causal_mask) -> torch.Tensor:
+    """Return the causal upper triangular mask for softmax input, for ONNX export.
+
+    ONNX does not support dynamic control-flow and requires non-square masks when
+    using a KV-cache.
+    """
+    derived_mask = onnx_causal_mask[seq_k-seq_q:seq_k, :seq_k].bool()
+    return derived_mask
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
     """
@@ -213,6 +223,11 @@ class FusedScaleMaskSoftmax(nn.Module):
         )
         self.mask_func = mask_func
         self.softmax_in_fp32 = softmax_in_fp32
+        max_seq = 1024 * 4
+        self.register_buffer(
+            "onnx_causal_mask",
+            torch.triu(torch.ones(max_seq, max_seq, device="cuda"), diagonal=1),
+        )
 
     def forward(
         self,
@@ -231,7 +246,7 @@ class FusedScaleMaskSoftmax(nn.Module):
             scale is None or self.softmax_in_fp32
         ), "softmax should be in fp32 when scaled"
 
-        if self.is_kernel_available(*inp.size()):
+        if self.is_kernel_available(*inp.size()) and not is_in_onnx_export_mode():
             return self.forward_fused_softmax(inp, mask, scale)
         return self.forward_torch_softmax(inp, mask, scale)
 
@@ -287,7 +302,12 @@ class FusedScaleMaskSoftmax(nn.Module):
             inp = inp * scale
 
         if self.attn_mask_type == "causal":
-            mask = _get_default_causal_mask(inp.size()[2])
+            if is_in_onnx_export_mode():
+                seq_len_q = inp.size(2)
+                seq_len_k = inp.size(3)
+                mask = _get_onnx_export_causal_mask(seq_len_q, seq_len_k, self.onnx_causal_mask)
+            else:
+                mask = _get_default_causal_mask(inp.size()[2])
 
         mask_output = self.mask_func(inp, mask) if mask is not None else inp
         probs = torch.nn.Softmax(dim=-1)(mask_output)

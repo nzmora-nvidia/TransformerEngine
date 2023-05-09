@@ -29,7 +29,7 @@ import numpy as np
 import onnxruntime as ort
 import torch
 from torch import nn as nn
-from typing import Union, Tuple
+from typing import Union, Tuple, List
 import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
 import transformer_engine_extensions as tex
@@ -68,6 +68,12 @@ ORT_CUSTOM_OPS_LIB = os.path.join(TESTS_DIR, "./libcustom_ort_fp8_qdq_ops.so")
 
 fp8_available, reason_for_no_fp8 = is_fp8_available()
 skip_FP8 = pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+
+
+# Reseed the PRNG
+@pytest.fixture()
+def seed_default_rng():
+    torch.random.seed()
 
 
 def create_fp8_recipe():
@@ -142,6 +148,32 @@ def te_infer(model: torch.nn.Module, inps: Union[Tuple[torch.tensor], torch.tens
         return te_outputs_np
 
 
+def compare_outputs(onnx_outputs, te_outputs, atol, rtol, max_errors_printed, allow_cnt_errors, fname):
+    """ Compare ORT and TE outputs."""
+    assert len(onnx_outputs) == len(te_outputs)
+    # Compare ORT and PyTorch outputs.
+    for onnx_output, te_output in zip(onnx_outputs, te_outputs):
+        # np.isclose: abs(a - b) <= (atol + rtol * abs(b))
+        ac = ~np.isclose(onnx_output, te_output, atol=atol, rtol=rtol)
+        mismatches = ac.nonzero()
+        mismatched_ids = [loc for loc in zip(*mismatches)]
+        if mismatched_ids:
+            # Log some information in case of error.
+            print("*" * 100)
+            nb_errors = len(mismatched_ids)
+            nb_vals = min(nb_errors, max_errors_printed)
+            print(f"Detected {nb_errors} diverging values (output shape={onnx_output.shape})")
+            print(f"Showing first {nb_vals} errors (ONNX -- TE):")
+            abs_err = np.abs(onnx_output - te_output)
+            errors = abs_err[mismatches]
+            for loc in mismatched_ids[:nb_vals]:
+                ref = te_output[loc]
+                print(f"{onnx_output[loc]} -- {te_output[loc]} err={abs_err[loc]} > {atol + rtol * abs(ref)}")
+            print(f"Max error: {np.max(errors)}")
+            if nb_errors > allow_cnt_errors:
+                raise ValueError(f"Output validation of {fname} failed with {nb_errors} errors")
+
+
 def validate_result(
     fname: str,
     inps: Union[Tuple[torch.Tensor], torch.Tensor],
@@ -153,6 +185,7 @@ def validate_result(
     allow_cnt_errors: int=0,
     input_names: list=["input"],
     output_names: list=["output"],
+    te_outputs: List[torch.Tensor]=None,
 ):
     """Compare the outputs of a Transformer Engine (TE) module vs the outputs of its ONNX
     representation using ONNX Runtime (ORT) and ensure they are close.
@@ -165,6 +198,8 @@ def validate_result(
     a very small number (0-3) of outliers. This is fine to do because these outliers are due to
     small kernel implementation differences between TE and ORT and do not imply an incorrect ONNX
     representation (the tests assume both ORT or TE kernels are correct).
+
+    Argument `te_outputs` can be used to provide pre-computed TE outputs.
     """
 
     def create_ort_session(fname: str, is_fp8: bool):
@@ -220,38 +255,14 @@ def validate_result(
         custom_outputs.add([output_data], runner_name="custom_runner")
         custom_outputs.save(json_fname)
 
-    def compare_outputs(onnx_outputs, te_outputs):
-        """ Compare ORT and TE outputs."""
-        assert len(onnx_outputs) == len(te_outputs)
-        # Compare ORT and PyTorch outputs.
-        for onnx_output, te_output in zip(onnx_outputs, te_outputs):
-            # np.isclose: abs(a - b) <= (atol + rtol * abs(b))
-            ac = ~np.isclose(onnx_output, te_output, atol=atol, rtol=rtol)
-            mismatches = ac.nonzero()
-            mismatched_ids = [loc for loc in zip(*mismatches)]
-            if mismatched_ids:
-                # Log some information in case of error.
-                print("*" * 100)
-                nb_errors = len(mismatched_ids)
-                nb_vals = min(nb_errors, max_errors_printed)
-                print(f"Detected {nb_errors} diverging values (output shape={onnx_output.shape})")
-                print(f"Showing first {nb_vals} errors (ONNX -- TE):")
-                abs_err = np.abs(onnx_output - te_output)
-                errors = abs_err[mismatches]
-                for loc in mismatched_ids[:nb_vals]:
-                    ref = te_output[loc]
-                    print(f"{onnx_output[loc]} -- {te_output[loc]} err={abs_err[loc]} > {atol + rtol * abs(ref)}")
-                print(f"Max error: {np.max(errors)}")
-                if nb_errors > allow_cnt_errors:
-                    raise ValueError(f"Output validation of {fname} failed with {nb_errors} errors")
-
     # Run ORT session and TE model.
     fname = os.path.join(NVTE_TEST_ARTIFACTS_DIR, fname)
-    te_outputs = te_infer(model, inps, is_fp8)
+    if not te_outputs:
+        te_outputs = te_infer(model, inps, is_fp8)
     ort_s = create_ort_session(fname, is_fp8)
     input_feed = create_ort_input_dict(ort_s, inps)
     onnx_outputs = ort_s.run(None, input_feed=input_feed)
-    compare_outputs(onnx_outputs, te_outputs)
+    compare_outputs(onnx_outputs, te_outputs, atol, rtol, max_errors_printed, allow_cnt_errors, fname)
     serialize_inputs_outputs(fname, inps, input_names, te_outputs, output_names)
 
 
@@ -604,26 +615,38 @@ def test_export_layernorm(
 
 
 @skip_FP8
-@pytest.mark.parametrize("softmax_def", [
+@pytest.mark.parametrize("softmax_fn", [
     softmax_defs.ScaledUpperTriangMaskedSoftmax,
     softmax_defs.ScaledMaskedSoftmax,
     softmax_defs.ScaledSoftmax,
+    te.softmax.FusedScaleMaskSoftmax,
 ])
 # Softmax kernel only supports FP16 or BF16!
 @pytest.mark.parametrize("precision", [torch.float16, torch.bfloat16])
-def test_export_softmax(softmax_def, precision):
+def test_export_softmax(softmax_fn, precision):
     class Test_Softmax(nn.Module):
-        def __init__(self, softmax_function, mask_inp=False):
+        def __init__(self, softmax_fn, mask_inp=False):
             super().__init__()
-            self.softmax_fn = softmax_function
+            self.softmax_fn = softmax_fn
+            self.scale = 8 # arbitrary value
             self.mask_inp = mask_inp
+            self.fused_scaled_softmax = None
+            if self.softmax_fn == te.softmax.FusedScaleMaskSoftmax:
+                #os.environ["NVTE_MASKED_SOFTMAX_FUSION"] = "0"
+                self.fused_scaled_softmax = te.softmax.FusedScaleMaskSoftmax(
+                    attn_mask_type="causal",
+                    mask_func=te.utils.attention_mask_func,
+                    softmax_in_fp32=True,
+                )
 
         def forward(self, inp, mask):
-            scale_factor = 8 # arbitrary value
-            if self.mask_inp:
-                ret = self.softmax_fn.apply(inp, mask, scale_factor)
+            if self.fused_scaled_softmax:
+                ret = self.fused_scaled_softmax(inp, mask, self.scale)
             else:
-                ret = self.softmax_fn.apply(inp, scale_factor)
+                if self.mask_inp:
+                    ret = self.softmax_fn.apply(inp, mask, self.scale)
+                else:
+                    ret = self.softmax_fn.apply(inp, self.scale)
             return ret
 
     # Set dimensions (these are arbitrary).
@@ -632,20 +655,23 @@ def test_export_softmax(softmax_def, precision):
     mask = None
     input_names = ["input"]
     inp_shape = [hidden_size, in_features, in_features, in_features]
-    if softmax_def == softmax_defs.ScaledUpperTriangMaskedSoftmax:
+    if softmax_fn == softmax_defs.ScaledUpperTriangMaskedSoftmax:
         inp_shape = [hidden_size, in_features, in_features]
         kernel_str = "ScaledUpperTriangMaskedSoftmax"
-        model = Test_Softmax(softmax_def)
-    elif softmax_def == softmax_defs.ScaledMaskedSoftmax:
+        model = Test_Softmax(softmax_fn)
+    elif softmax_fn == softmax_defs.ScaledMaskedSoftmax:
         # Generate a random mask with 50% probability for 0 or 1.
         probs = 0.5 * torch.ones(hidden_size, 1, in_features, in_features, device="cuda", dtype=precision)
         mask = torch.bernoulli(probs).to("cuda", dtype=torch.bool)
         input_names.append("mask")
         kernel_str = "ScaledMaskedSoftmax"
-        model = Test_Softmax(softmax_def, mask_inp=True)
-    elif softmax_def == softmax_defs.ScaledSoftmax:
+        model = Test_Softmax(softmax_fn, mask_inp=True)
+    elif softmax_fn == softmax_defs.ScaledSoftmax:
         kernel_str = "ScaledSoftmax"
-        model = Test_Softmax(softmax_def)
+        model = Test_Softmax(softmax_fn)
+    elif softmax_fn == te.softmax.FusedScaleMaskSoftmax:
+        kernel_str = "TorchSoftmax"
+        model = Test_Softmax(softmax_fn)
     input_tensor = torch.randn(*inp_shape, device="cuda")
     input_tensor = input_tensor.to(torch.bfloat16) if precision == torch.bfloat16 else input_tensor.half()
     high_prec_str = dtype2str(precision)
@@ -654,6 +680,58 @@ def test_export_softmax(softmax_def, precision):
     do_export(model, inp, fname, input_names=input_names)
     if precision != torch.bfloat16:
         validate_result(fname, inp, model, atol=1e-3, input_names=input_names)
+
+
+# Test dynamically generated softmax mask.
+# Softmax kernel only supports FP16 or BF16!
+@pytest.mark.parametrize("precision", [torch.float16])
+def test_softmax_mask_fn(precision):
+    class Test_Softmax(nn.Module):
+        def __init__(self, use_onnx_mask_fn: bool):
+            super().__init__()
+            self.scale = 1 # arbitrary value
+            # Use NVTE_MASKED_SOFTMAX_FUSION to force TE to use forward_torch_softmax
+            # even when is_in_onnx_export_mode()==False.
+            os.environ["NVTE_MASKED_SOFTMAX_FUSION"] = "0"
+            self.fused_scaled_softmax = te.softmax.FusedScaleMaskSoftmax(
+                attn_mask_type="causal",
+                mask_func=te.utils.attention_mask_func,
+                softmax_in_fp32=True,
+            )
+
+        def forward(self, inp, mask):
+            ret = self.fused_scaled_softmax(inp, mask, self.scale)
+            return ret
+
+    # Set dimensions (these are arbitrary).
+    in_features = 64
+    hidden_size = 256
+    mask = None
+    inp_shape = [hidden_size, in_features, in_features, in_features]
+    input_tensor = torch.randn(*inp_shape, device="cuda")
+    input_tensor = input_tensor.to(torch.bfloat16) if precision == torch.bfloat16 else input_tensor.half()
+    inp = (input_tensor, mask)
+    high_prec_str = dtype2str(precision)
+
+    # Compare the outputs of TE when using the default softmax mask
+    # to the TE outputs produced when using the ONNX-compatible causal mask.
+    model = Test_Softmax(use_onnx_mask_fn=False)
+    te_outputs_default_mask = te_infer(model, (input_tensor, mask), is_fp8=True)
+    with te.onnx_export(True):
+        # ONNX export mode forces use of the ONNX-compatible causal mask.
+        model_onnx_mask = Test_Softmax(use_onnx_mask_fn=True)
+        te_outputs_onnx_mask = te_infer(model_onnx_mask, (input_tensor, mask), is_fp8=True)
+    compare_outputs(te_outputs_default_mask, te_outputs_onnx_mask,
+        atol=0, rtol=0, max_errors_printed=10, allow_cnt_errors=0, fname="softmax masking")
+
+    # Compare the outputs of TE when using the default softmax mask
+    # to the ORT ONNX outputs produced when using the ONNX-compatible causal mask.
+    input_names = ["input"]
+    kernel_str = "FusedScaleMaskSoftmax"
+    fname = f"{kernel_str}{high_prec_str}.onnx"
+    do_export(model, inp, fname, input_names=input_names)
+    if precision != torch.bfloat16:
+        validate_result(fname, inp, model_onnx_mask, atol=1e-3, input_names=input_names, te_outputs=te_outputs_default_mask)
 
 
 @pytest.mark.parametrize("scale_factor", [1])
@@ -861,7 +939,7 @@ def test_export_core_attention(
     # Set dimensions (these are arbitrary).
     kv_channels = 64
     num_attention_heads = 1
-    qkv_size = (2048, 4, num_attention_heads, kv_channels)
+    qkv_size = (256, 4, num_attention_heads, kv_channels)
 
     query_layer = torch.randn(qkv_size, dtype=precision, device="cuda")
     key_layer = torch.randn(qkv_size, dtype=precision, device="cuda")
@@ -949,7 +1027,13 @@ def test_export_multihead_attention(
         init_method,
         output_layer_init_method,
     )
-    hidden_states = torch.randn(sequence_length, batch_size, hidden_size, dtype=precision, device="cuda")
+
+    # In GPT generative phase (inference) the input sequence is smaller than the maximum
+    # allowed sequence length and we want to test this condition.
+    # Pretend that we're in generative phase when it makes sense (causal mask and self-attention).
+    is_generative_phase = (attn_mask_type == "causal" and attention_type == "self")
+    seq_len_offset = 10 if is_generative_phase else 0
+    hidden_states = torch.randn(sequence_length-seq_len_offset, batch_size, hidden_size, dtype=precision, device="cuda")
 
     attention_mask = None
     if use_mask and attn_mask_type != "causal":
@@ -984,12 +1068,10 @@ def test_export_multihead_attention(
     do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names)
     if not use_fp8:
         validate_result(fname, inp, model, atol=1e-3, input_names=input_names, output_names=output_names)
-    elif precision == torch.float32:
-        validate_result(fname, inp, model, atol=1e-2, is_fp8=use_fp8,
-            input_names=input_names, output_names=output_names)
     else:
         validate_result(fname, inp, model, atol=1e-2, is_fp8=use_fp8,
             input_names=input_names, output_names=output_names, allow_cnt_errors=3)
+
 
 @pytest.mark.parametrize("use_fp8", [False, True])
 @pytest.mark.parametrize("use_mask, attn_mask_type", test_configs_multihead_attention)
