@@ -32,6 +32,10 @@ def _get_onnx_export_causal_mask(seq_q: int, seq_k: int, onnx_causal_mask) -> to
     ONNX does not support dynamic control-flow and requires non-square masks when
     using a KV-cache.
     """
+    sq = 2048
+    if sq not in _default_causal_mask:
+        _default_causal_mask[sq] = torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
+    onnx_causal_mask = _default_causal_mask[sq]
     derived_mask = onnx_causal_mask[seq_k-seq_q:seq_k, :seq_k].bool()
     return derived_mask
 
@@ -209,6 +213,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         mask_func: mask function to be applied.
         softmax_in_fp32: if true, softmax in performed at fp32 precision.
     """
+    # _onnx_causal_mask = torch.triu(torch.ones(4096, 40996, device="cuda"), diagonal=1)
 
     def __init__(
         self,
@@ -224,10 +229,10 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.mask_func = mask_func
         self.softmax_in_fp32 = softmax_in_fp32
         max_seq = 1024 * 4
-        self.register_buffer(
-            "onnx_causal_mask",
-            torch.triu(torch.ones(max_seq, max_seq, device="cuda"), diagonal=1),
-        )
+        # self.register_buffer(
+        #     "onnx_causal_mask",
+        #     torch.triu(torch.ones(max_seq, max_seq, device="cuda"), diagonal=1),
+        # )
 
     def forward(
         self,
@@ -305,7 +310,10 @@ class FusedScaleMaskSoftmax(nn.Module):
             if is_in_onnx_export_mode():
                 seq_len_q = inp.size(2)
                 seq_len_k = inp.size(3)
-                mask = _get_onnx_export_causal_mask(seq_len_q, seq_len_k, self.onnx_causal_mask)
+                # _onnx_causal_mask = torch.triu(torch.ones(4096, 40996, device="cuda"), diagonal=1)
+                #mask = _get_onnx_export_causal_mask(seq_len_q, seq_len_k, self.onnx_causal_mask)
+                # mask = _get_onnx_export_causal_mask(seq_len_q, seq_len_k, FusedScaleMaskSoftmax._onnx_causal_mask)
+                mask = _get_onnx_export_causal_mask(seq_len_q, seq_len_k, None)
             else:
                 mask = _get_default_causal_mask(inp.size()[2])
 
