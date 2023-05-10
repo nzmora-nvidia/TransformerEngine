@@ -30,14 +30,12 @@ def _get_onnx_export_causal_mask(seq_q: int, seq_k: int, onnx_causal_mask) -> to
     """Return the causal upper triangular mask for softmax input, for ONNX export.
 
     ONNX does not support dynamic control-flow and requires non-square masks when
-    using a KV-cache.
+    using a KV-cache (seq_k's length len(context)+len(generative) while seq_q's length is 1).
     """
-    sq = seq_k
-    if sq not in _default_causal_mask:
-        _default_causal_mask[sq] = torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
-    onnx_causal_mask = _default_causal_mask[sq]
+    onnx_causal_mask = torch.triu(torch.ones(seq_k, seq_k, device="cuda"), diagonal=1).bool()
     derived_mask = onnx_causal_mask[seq_k-seq_q:seq_k, :seq_k].bool()
     return derived_mask
+
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
     """
@@ -308,11 +306,7 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         if self.attn_mask_type == "causal":
             if is_in_onnx_export_mode():
-                seq_len_q = inp.size(2)
-                seq_len_k = inp.size(3)
-                # _onnx_causal_mask = torch.triu(torch.ones(4096, 40996, device="cuda"), diagonal=1)
-                #mask = _get_onnx_export_causal_mask(seq_len_q, seq_len_k, self.onnx_causal_mask)
-                # mask = _get_onnx_export_causal_mask(seq_len_q, seq_len_k, FusedScaleMaskSoftmax._onnx_causal_mask)
+                seq_len_q, seq_len_k = inp.size(2), inp.size(3)
                 mask = _get_onnx_export_causal_mask(seq_len_q, seq_len_k, None)
             else:
                 mask = _get_default_causal_mask(inp.size()[2])

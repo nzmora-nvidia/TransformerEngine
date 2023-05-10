@@ -86,8 +86,9 @@ def do_export(
     fname: str,
     use_fp8: bool=True,
     opset: int=OPSET,
-    input_names: list=["input"],
-    output_names: list=["output"],
+    input_names: List=["input"],
+    output_names: List=["output"],
+    dynamic_axes: List[str]=None
 ):
     """Export to ONNX"""
     fp8_recipe = create_fp8_recipe()
@@ -109,6 +110,7 @@ def do_export(
                 inps,
                 fname,
                 verbose=True,
+                dynamic_axes=dynamic_axes,
                 opset_version=opset,
                 input_names=input_names,
                 output_names=output_names,
@@ -1253,6 +1255,64 @@ def test_export_gemm_layernorm(
     if precision not in (torch.bfloat16, ):
         validate_result(
             fname, (inp, weight), model, atol=5e-2, is_fp8=use_fp8, allow_cnt_errors=2)
+
+
+@pytest.mark.parametrize("use_fp8", [True, False])
+@pytest.mark.parametrize("precision", [torch.float16])
+@pytest.mark.parametrize("zero_centered_gamma", [True])
+def test_export_gpt_generation(
+    use_fp8: bool,
+    precision: torch.dtype,
+    zero_centered_gamma: bool
+):
+    # Skip FP8 tests on non-hopper devices
+    if use_fp8 and not fp8_available:
+        pytest.skip(reason_for_no_fp8)
+
+    # Layer configuration
+    hidden_size = 64
+    sequence_length = 128
+    batch_size = 1
+    ffn_hidden_size = 256
+    num_attention_heads = 4
+    attention_mask = None
+    use_mask = True
+    attn_mask_type = "causal"
+    fuse_qkv_params = True
+    output_layernorm = False
+
+    fp8_str = "_fp8" if use_fp8 else ""
+    fuse_qkv_params_str = "_fused-qkv" if fuse_qkv_params else ""
+    high_prec_str = dtype2str(precision)
+    attn_mask_str = get_attn_mask_str(use_mask, attn_mask_type)
+    fname = f"te.transformer_layer_generative{fp8_str}{attn_mask_str}{fuse_qkv_params_str}{high_prec_str}.onnx"
+
+    model = te.TransformerLayer(
+        hidden_size,
+        ffn_hidden_size,
+        num_attention_heads,
+        self_attn_mask_type=attn_mask_type,
+        output_layernorm=output_layernorm,
+        params_dtype=precision,
+        fuse_qkv_params=fuse_qkv_params,
+        zero_centered_gamma=zero_centered_gamma).to(device='cuda')
+
+    # "Context phase": use full input sequence length
+    input_names = ["input"]
+    output_names = ["output"]
+    input_tensor = torch.rand(sequence_length, batch_size, hidden_size, dtype=precision, device="cuda")
+    inp = (input_tensor,)
+    do_export(model, inp, fname, use_fp8,
+        input_names=input_names, output_names=output_names,
+        dynamic_axes={"input": {0: "seq", 1:"bs"},
+                      "output": {0: "seq", 1:"bs"}, })
+    validate_result(fname, inp, model, atol=5e-3, is_fp8=use_fp8, input_names=input_names)
+
+    # "Generative phase": use a single input (sequence len=1). For FP8 we need to pad the sequence to mult of 8.
+    sequence_length = 1 if not use_fp8 else 8
+    input_tensor = torch.rand(sequence_length, batch_size, hidden_size, dtype=precision, device="cuda")
+    inp = (input_tensor, attention_mask)
+    validate_result(fname, inp, model, atol=5e-3, is_fp8=use_fp8, input_names=input_names)
 
 
 @pytest.mark.parametrize("enabled", [True, False])
