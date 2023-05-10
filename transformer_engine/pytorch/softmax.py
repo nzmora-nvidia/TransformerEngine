@@ -32,7 +32,7 @@ def _get_onnx_export_causal_mask(seq_q: int, seq_k: int, onnx_causal_mask) -> to
     ONNX does not support dynamic control-flow and requires non-square masks when
     using a KV-cache.
     """
-    sq = 2048
+    sq = seq_k
     if sq not in _default_causal_mask:
         _default_causal_mask[sq] = torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
     onnx_causal_mask = _default_causal_mask[sq]
