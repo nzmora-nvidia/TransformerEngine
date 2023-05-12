@@ -570,6 +570,7 @@ class MultiHeadAttention(torch.nn.Module):
         ub_split_rs: bool = False,
         ub_split_ag: bool = False,
         bias: bool = True,
+        return_kv_cache: bool = False,
     ) -> None:
         super().__init__()
         self.layer_number = (layer_number,)
@@ -581,6 +582,7 @@ class MultiHeadAttention(torch.nn.Module):
         self.params_dtype = params_dtype
         self.init_method = init_method
         self.attn_mask_type = attn_mask_type
+        self.return_kv_cache = return_kv_cache
 
         if not fuse_qkv_params:
             qkv_weight_interleaved = False
@@ -726,6 +728,8 @@ class MultiHeadAttention(torch.nn.Module):
         is_first_microbatch: Optional[bool] = None,
         checkpoint_core_attention: bool = False,
         inference_params: Optional[Any] = None,
+        past_key: Optional[torch.Tensor] = None,
+        past_value : Optional[torch.Tensor] = None,
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         """MultiHeadAttention FWD"""
         # hidden_states: [sq, b, h]
@@ -884,6 +888,10 @@ class MultiHeadAttention(torch.nn.Module):
                 :sequence_end, batch_start:batch_end, ...
             ]
 
+        if past_key is not None and past_value is not None:
+            key_layer = torch.concat((past_key, key_layer))
+            value_layer = torch.concat((past_value, value_layer))
+
         # ==================================
         # core attention computation
         # ==================================
@@ -906,4 +914,6 @@ class MultiHeadAttention(torch.nn.Module):
 
         if self.input_layernorm and self.return_layernorm_output:
             return attention_output, attention_bias, layernorm_output
+        if self.return_kv_cache:
+            return attention_output, attention_bias, key_layer, value_layer
         return attention_output, attention_bias

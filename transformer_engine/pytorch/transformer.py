@@ -216,6 +216,7 @@ class TransformerLayer(torch.nn.Module):
         qkv_weight_interleaved: bool = True,
         ub_tp_comm_overlap: bool = False,
         bias: bool = True,
+        return_kv_cache: Optional[bool] = False,
     ) -> None:
         super().__init__()
 
@@ -239,6 +240,7 @@ class TransformerLayer(torch.nn.Module):
         self.layer_number = layer_number
         self.output_layernorm = output_layernorm
         self.layer_type = layer_type
+        self.return_kv_cache = return_kv_cache
         self.apply_residual_connection_post_layernorm = (
             apply_residual_connection_post_layernorm
         )
@@ -394,6 +396,8 @@ class TransformerLayer(torch.nn.Module):
         is_first_microbatch: Optional[bool] = None,
         checkpoint_core_attention: bool = False,
         inference_params: Optional[Any] = None,
+        past_key: Optional[torch.Tensor] = None,
+        past_value : Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Transformer Layer: attention block and a feedforward network (MLP)
@@ -460,13 +464,18 @@ class TransformerLayer(torch.nn.Module):
             inference_params=inference_params,
             is_first_microbatch=is_first_microbatch,
             checkpoint_core_attention=checkpoint_core_attention,
+            past_key=past_key,
+            past_value=past_value,
         )
 
         if self.apply_residual_connection_post_layernorm and not self.output_layernorm:
             attention_output, attention_bias, residual = self_attention_outputs
         else:
-            attention_output, attention_bias = self_attention_outputs
             residual = hidden_states
+            if self.return_kv_cache:
+                attention_output, attention_bias, key_layer, value_layer = self_attention_outputs
+            else:
+                attention_output, attention_bias = self_attention_outputs
 
         # Set BDA func.
         if self.bias_dropout_fusion:
@@ -552,5 +561,7 @@ class TransformerLayer(torch.nn.Module):
         if self.output_layernorm:
             output = self.layernorm(output)
 
+        if self.return_kv_cache:
+            return output, key_layer, value_layer
         # output: [b, s, h]
         return output
