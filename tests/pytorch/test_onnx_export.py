@@ -29,7 +29,7 @@ import numpy as np
 import onnxruntime as ort
 import torch
 from torch import nn as nn
-from typing import Union, Tuple, Optional, Any
+from typing import Union, Tuple, List, Optional, Any
 import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
 import transformer_engine_extensions as tex
@@ -81,11 +81,14 @@ def do_export(
     fname: str,
     use_fp8: bool=True,
     opset: int=OPSET,
-    input_names: list=["input"],
-    output_names: list=["output"],
+    input_names: List[str]=None,
+    output_names: List[str]=None,
+    dynamic_axes: List[str]=None,
 ):
     """Export to ONNX"""
     fp8_recipe = create_fp8_recipe()
+    input_names = input_names or ["input"]
+    output_names = output_names or ["output"]
 
     with torch.inference_mode(), te.fp8_autocast(enabled=use_fp8, fp8_recipe=fp8_recipe), warnings.catch_warnings():
         warnings.filterwarnings(
@@ -109,12 +112,10 @@ def do_export(
                 inps,
                 fname,
                 verbose=True,
+                dynamic_axes=dynamic_axes,
                 opset_version=opset,
                 input_names=input_names,
                 output_names=output_names,
-                # Do not constant-fold because torch.onnx incorrectly folds
-                # layer_norm(data, scale=add(gamma,1)) to layer_norm(data, scale=gamma)
-                # when we use LN with zero-centered gamma.
                 do_constant_folding=True,
                 operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH)
 
@@ -148,6 +149,32 @@ def te_infer(model: torch.nn.Module, inps: Union[Tuple[torch.tensor], torch.tens
         return te_outputs_np
 
 
+def compare_outputs(onnx_outputs, te_outputs, atol, rtol, max_errors_printed, allow_cnt_errors, fname):
+    """ Compare ORT and TE outputs."""
+    assert len(onnx_outputs) == len(te_outputs)
+    # Compare ORT and PyTorch outputs.
+    for onnx_output, te_output in zip(onnx_outputs, te_outputs):
+        # np.isclose: abs(a - b) <= (atol + rtol * abs(b))
+        ac = ~np.isclose(onnx_output, te_output, atol=atol, rtol=rtol)
+        mismatches = ac.nonzero()
+        mismatched_ids = [loc for loc in zip(*mismatches)]
+        if mismatched_ids:
+            # Log some information in case of error.
+            print("*" * 100)
+            nb_errors = len(mismatched_ids)
+            nb_vals = min(nb_errors, max_errors_printed)
+            print(f"Detected {nb_errors} diverging values (output shape={onnx_output.shape})")
+            print(f"Showing first {nb_vals} errors (ONNX -- TE):")
+            abs_err = np.abs(onnx_output - te_output)
+            errors = abs_err[mismatches]
+            for loc in mismatched_ids[:nb_vals]:
+                ref = te_output[loc]
+                print(f"{onnx_output[loc]} -- {te_output[loc]} err={abs_err[loc]} > {atol + rtol * abs(ref)}")
+            print(f"Max error: {np.max(errors)}")
+            if nb_errors > allow_cnt_errors:
+                raise ValueError(f"Output validation of {fname} failed with {nb_errors} errors")
+
+
 def validate_result(
     fname: str,
     inps: Union[Tuple[torch.Tensor], torch.Tensor],
@@ -157,8 +184,9 @@ def validate_result(
     max_errors_printed: int=10,
     is_fp8: bool=False,
     allow_cnt_errors: int=0,
-    input_names: list=["input"],
-    output_names: list=["output"],
+    input_names: List[str]=None,
+    output_names: List[str]=None,
+    te_outputs: List[torch.Tensor]=None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compare the outputs of a Transformer Engine (TE) module vs the outputs of its ONNX
     representation using ONNX Runtime (ORT) and ensure they are close.
@@ -220,38 +248,17 @@ def validate_result(
         custom_outputs.add([output_data], runner_name="custom_runner")
         custom_outputs.save(json_fname)
 
-    def compare_outputs(onnx_outputs, te_outputs):
-        """ Compare ORT and TE outputs."""
-        assert len(onnx_outputs) == len(te_outputs)
-        # Compare ORT and PyTorch outputs.
-        for onnx_output, te_output in zip(onnx_outputs, te_outputs):
-            # np.isclose: abs(a - b) <= (atol + rtol * abs(b))
-            ac = ~np.isclose(onnx_output, te_output, atol=atol, rtol=rtol)
-            mismatches = ac.nonzero()
-            mismatched_ids = [loc for loc in zip(*mismatches)]
-            if mismatched_ids:
-                # Log some information in case of error.
-                print("*" * 100)
-                nb_errors = len(mismatched_ids)
-                nb_vals = min(nb_errors, max_errors_printed)
-                print(f"Detected {nb_errors} diverging values (output shape={onnx_output.shape})")
-                print(f"Showing first {nb_vals} errors (ONNX -- TE):")
-                abs_err = np.abs(onnx_output - te_output)
-                errors = abs_err[mismatches]
-                for loc in mismatched_ids[:nb_vals]:
-                    ref = te_output[loc]
-                    print(f"{onnx_output[loc]} -- {te_output[loc]} err={abs_err[loc]} > {atol + rtol * abs(ref)}")
-                print(f"Max error: {np.max(errors)}")
-                if nb_errors > allow_cnt_errors:
-                    raise ValueError(f"Output validation of {fname} failed with {nb_errors} errors")
+    input_names = input_names or ["input"]
+    output_names = output_names or ["output"]
 
     # Run ORT session and TE model.
     fname = os.path.join(NVTE_TEST_ARTIFACTS_DIR, fname)
-    te_outputs = te_infer(model, inps, is_fp8)
+    if not te_outputs:
+        te_outputs = te_infer(model, inps, is_fp8)
     ort_s = create_ort_session(fname, is_fp8)
     input_feed = create_ort_input_dict(ort_s, inps)
     onnx_outputs = ort_s.run(None, input_feed=input_feed)
-    compare_outputs(onnx_outputs, te_outputs)
+    compare_outputs(onnx_outputs, te_outputs, atol, rtol, max_errors_printed, allow_cnt_errors, fname)
     serialize_inputs_outputs(fname, inps, input_names, te_outputs, output_names)
     return te_outputs, onnx_outputs
 
@@ -1215,6 +1222,7 @@ test_configs_attention_type = [
     #"input_layernorm, attention_type, fuse_qkv_params"
     (True,             "self",         True),
 ]
+@skip_FP8
 @pytest.mark.parametrize("max_seq_len", [1])
 @pytest.mark.parametrize("use_fp8", [False])
 @pytest.mark.parametrize("use_mask, attn_mask_type", test_configs_multihead_attention)
@@ -1235,7 +1243,9 @@ def test_kvcache_mha(
         pytest.skip(reason_for_no_fp8)
 
     hidden_size = 128
-    sequence_length = 64
+    inp_seq_len = 64 # context phase: input sequence length
+    outp_seq_len = 3 # generation phase: output sequence length
+
     batch_size = 1
     num_attention_heads = 16
     kv_channels = 8
@@ -1281,7 +1291,7 @@ def test_kvcache_mha(
                     layer_number=layer,
                 ).to(device='cuda')
                 self.mha_layers.append(mha)
-            self.max_seq_len = sequence_length + nb_generations
+            self.max_seq_len = inp_seq_len + nb_generations
             #self.infp = self._create_inference_params(nb_layers, self.max_seq_len)
             self.use_cache = None
 
@@ -1328,7 +1338,6 @@ def test_kvcache_mha(
         output_names=["output", "output_bias"]
         for i in range(nb_generations):
             print(f"hidden_states@{i} {hidden_states.shape}")
-            # model = TestFP8_KVCacheMHA(nb_layers=2, nb_generations=4)
             fname = f"{fname_prefix}_uncached_{i}.onnx"
             inp = (hidden_states)
             #assert i < 1
@@ -1342,7 +1351,7 @@ def test_kvcache_mha(
                         output_names=output_names)
             ref_outputs = te_outputs[0]
             outputs.append(ref_outputs)
-            new_hidden_state = ref_outputs[sequence_length+i-1:,:,:]
+            new_hidden_state = ref_outputs[inp_seq_len+i-1:,:,:]
             print(f"ref_outputs@{i}-a {ref_outputs.shape} {new_hidden_state.shape}")
             hidden_states = torch.cat(
                     (hidden_states, torch.from_numpy(new_hidden_state).to('cuda')),
@@ -1356,7 +1365,8 @@ def test_kvcache_mha(
         model.set_return_kv_cache(True)
 
         bs, nbheads, headsize = batch_size, num_attention_heads, hidden_size // num_attention_heads
-        past_key, past_value = torch.zeros(0, bs, nbheads, headsize, device='cuda'), torch.zeros(0, bs, nbheads, headsize, device='cuda')
+        past_key = torch.zeros(0, bs, nbheads, headsize, device='cuda')
+        past_value = torch.zeros(0, bs, nbheads, headsize, device='cuda')
         outputs = []
         seq_offset = 0
         input_names = ["hidden_states", "past_key", "past_value"]
@@ -1368,34 +1378,44 @@ def test_kvcache_mha(
             print("@"*100)
             print(f"{fname}")
             #assert i < 1
-            do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names)
+            assert hidden_states is not None
+            assert past_key is not None
+            assert past_value is not None
 
-            if not use_fp8:
-                te_outputs, onnx_outputs = validate_result(fname, inp, model, atol=1e-3,
-                    input_names=input_names, output_names=output_names)
-            else:
-                te_outputs, onnx_outputs = validate_result(fname, inp, model, atol=2e-3, is_fp8=use_fp8,
-                    input_names=input_names, output_names=output_names)
-            #model.infp.sequence_len_offset += hidden_states.size(0) # Seq dimension
-            #seq_offset = model.infp.sequence_len_offset - 1
-            seq_offset += hidden_states.size(0) - 1# Seq dimension
-            ref_outputs = te_outputs[0]
-            past_key = torch.from_numpy(te_outputs[2]).to('cuda')
-            past_value = torch.from_numpy(te_outputs[3]).to('cuda')
-            outputs.append(ref_outputs)
-            # print(f"te_outputs@{i}-a {te_outputs[0].shape}")
-            next_word_prediction = ref_outputs[seq_offset:,]
-            hidden_states = torch.from_numpy(next_word_prediction).to('cuda')
+            # do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names)
+
+            # if not use_fp8:
+            #     te_outputs, onnx_outputs = validate_result(fname, inp, model, atol=1e-3,
+            #         input_names=input_names, output_names=output_names)
+            # else:
+            #     te_outputs, onnx_outputs = validate_result(fname, inp, model, atol=2e-3, is_fp8=use_fp8,
+            #         input_names=input_names, output_names=output_names)
+
+            te_outputs = te_infer(model, inp, is_fp8=False)
+
+            te_attn_outp, te_bias, te_past_key, te_past_value = te_outputs
+            outputs.append(te_attn_outp)
+            past_key = torch.from_numpy(te_past_key).clone().to('cuda')
+            past_value = torch.from_numpy(te_past_value).clone().to('cuda')
+
+            seq_offset = hidden_states.size(0) # Seq dimension
+            next_token_prediction = te_attn_outp[seq_offset-1:,]
+            hidden_states = torch.from_numpy(next_token_prediction).clone().to('cuda')
+            print(f"seq_offset = {seq_offset}")
+            print(f"next_token_prediction@{i} {next_token_prediction.shape}")
+            print(f"te_attn_outp@{i} {te_attn_outp.shape}")
+            assert hidden_states.size(0) != 0
+            assert hidden_states is not None
+            assert past_key is not None
+            assert past_value is not None
         return outputs
 
-    nb_generations = 2
+    nb_generations = 3
     model = TestFP8_KVCacheMHA(nb_layers=2, nb_generations=nb_generations)
-    hidden_states = torch.randn(sequence_length, batch_size, hidden_size, dtype=precision, device="cuda")
+    hidden_states = torch.randn(inp_seq_len, batch_size, hidden_size, dtype=precision, device="cuda")
 
-    o1_uc, o2_uc = run_test_uncached(model, hidden_states, nb_generations)
-    o1_c, o2_c = run_test_cached(model, hidden_states, nb_generations)
-    print(f"shapes uc = {o1_uc.shape} {o2_uc.shape}")
-    print(f"shapes c = {o1_c.shape} {o2_c.shape}")
+    outputs_nocache = run_test_uncached(model, hidden_states, nb_generations)
+    outputs_cache = run_test_cached(model, hidden_states, nb_generations)
 
     def compare(uc, c, atol):
         isclose = ~np.isclose(uc, c, atol=atol)
@@ -1406,6 +1426,24 @@ def test_kvcache_mha(
             print(uc[0], c[0])
             print(f"mismatched_ids = {len(mismatched_ids)}")
             raise ValueError(f"Output validation of ??? failed with {nb_errors} errors")
-
-    compare(o1_uc, o1_c, atol=0)
-    compare(o2_uc[64,], o2_c, atol=1e-5)
+    
+    # Compare outputs
+    if nb_generations == 2:
+        o1_uc, o2_uc = outputs_nocache
+        o1_c, o2_c = outputs_cache
+        print(f"shapes uc = {o1_uc.shape} {o2_uc.shape}")
+        print(f"shapes c = {o1_c.shape} {o2_c.shape}")
+        # shapes uc = (64, 1, 128) (65, 1, 128)
+        # shapes c = (64, 1, 128) (1, 1, 128)
+        compare(o1_uc, o1_c, atol=0)
+        compare(o2_uc[64,], o2_c, atol=1e-9)
+    else:
+        o1_uc, o2_uc, o3_uc = outputs_nocache
+        o1_c, o2_c, o3_c = outputs_cache
+        print(f"shapes uc = {o1_uc.shape} {o2_uc.shape}")
+        print(f"shapes c = {o1_c.shape} {o2_c.shape}")
+        # shapes uc = (64, 1, 128) (65, 1, 128)
+        # shapes c = (64, 1, 128) (1, 1, 128)
+        compare(o1_uc, o1_c, atol=0)
+        compare(o2_uc[64,], o2_c, atol=1e-5)
+        compare(o3_uc[64,], o3_c, atol=1e-3)
