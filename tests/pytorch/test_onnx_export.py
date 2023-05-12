@@ -1324,13 +1324,18 @@ def test_kvcache_mha(
         model.use_cache = False
         outputs = []
         input_names = ["hidden_states"]
-        output_names=["output", "output_bias"]
+        output_names=["attn_output", "attn_bias"]
+        fname = f"{fname_prefix}_uncached_.onnx"
+        inp = (hidden_states)
+        do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names,
+            dynamic_axes={
+                "hidden_states": {0: "seq", 1:"bs"},
+                "attn_output": {0: "seq", 1:"bs"},
+            })
+
         for i in range(nb_generations+1):
             print(f"hidden_states@{i} {hidden_states.shape}")
-            fname = f"{fname_prefix}_uncached_{i}.onnx"
             inp = (hidden_states)
-            #assert i < 1
-            do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names)
             if not use_fp8:
                 te_outputs, onnx_outputs = validate_result(
                         fname, inp, model, atol=1e-3, input_names=input_names, output_names=output_names)
@@ -1359,10 +1364,21 @@ def test_kvcache_mha(
         outputs = []
         seq_offset = 0
         input_names = ["hidden_states", "past_key", "past_value"]
-        output_names=["output", "output_bias", "new_key", "new_value"]
+        output_names = ["attn_output", "attn_bias", "new_key", "new_value"]
+        inp = (hidden_states, past_key, past_value)
+        fname = f"{fname_prefix}_cached_.onnx"
+        do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names,
+            dynamic_axes={
+                "hidden_states": {0: "seq", 1:"bs"},
+                "past_key": {0: "past_key_seq", 1:"bs"},
+                "past_value": {0: "past_value_seq", 1:"bs"},
+                "attn_output": {0: "seq", 1:"bs"},
+                "new_key": {0: "new_key_seq", 1:"bs"},
+                "new_value": {0: "new_value_seq", 1:"bs"}
+            })
+
         for i in range(nb_generations+1):
             print(f"hidden_states@{i} {hidden_states.shape}")
-            fname = f"{fname_prefix}_cached_{i}.onnx"
             inp = (hidden_states, past_key, past_value)
             print("@"*100)
             print(f"{fname}")
@@ -1370,8 +1386,6 @@ def test_kvcache_mha(
             assert hidden_states is not None
             assert past_key is not None
             assert past_value is not None
-
-            do_export(model, inp, fname, use_fp8, input_names=input_names, output_names=output_names)
 
             if not use_fp8:
                 te_outputs, onnx_outputs = validate_result(fname, inp, model, atol=1e-3,
@@ -1415,24 +1429,9 @@ def test_kvcache_mha(
             print(f"mismatched_ids = {len(mismatched_ids)}")
             raise ValueError(f"Output validation of ??? failed with {nb_errors} errors")
 
-    # Compare outputs
-    # if nb_generations == 1:
-    #     o1_uc, o2_uc = outputs_nocache
-    #     o1_c, o2_c = outputs_cache
-    #     print(f"shapes uc = {o1_uc.shape} {o2_uc.shape}")
-    #     print(f"shapes c = {o1_c.shape} {o2_c.shape}")
-    #     # shapes uc = (64, 1, 128) (65, 1, 128)
-    #     # shapes c = (64, 1, 128) (1, 1, 128)
-    #     compare(o1_uc, o1_c, atol=0)
-    #     compare(o2_uc[64,], o2_c, atol=1e-9)
-    # else:
-    #     assert nb_generations == 2
-    # o1_uc, o2_uc, o3_uc = outputs_nocache
-    # o1_c, o2_c, o3_c = outputs_cache
-
     # Compare context phase output
-    context_output_cache = outputs_cache[0]     # (64, 1, 128) = (inp_seq_len, batch_size, hidden_size)
-    context_output_nocache = outputs_nocache[0] # (64, 1, 128) = (inp_seq_len, batch_size, hidden_size)
+    context_output_cache = outputs_cache[0]     # (inp_seq_len, batch_size, hidden_size)
+    context_output_nocache = outputs_nocache[0] # (inp_seq_len, batch_size, hidden_size)
     compare(context_output_cache, context_output_nocache, atol=0)
 
     # print(f"shapes uc = {o1_uc.shape} {o2_uc.shape}")
@@ -1441,9 +1440,11 @@ def test_kvcache_mha(
     # shapes c = (64, 1, 128) (1, 1, 128)
     # compare(o1_uc, o1_c, atol=0)
     for gen in range(nb_generations):
+        # Iteratively generate output tokens and compare the output created when MHA uses a KV-cache
+        # to hte output created by generation without a cache.
         iter = gen + 1
-        generation_output_cache = outputs_cache[iter] # (1, batch_size, hidden_size)
-        generation_output_nocache = outputs_nocache[iter][inp_seq_len + gen] # (inp_seq_len+iter, batch_size, hidden_size)
+        # (1, batch_size, hidden_size)
+        generation_output_cache = outputs_cache[iter]
+        # (inp_seq_len+iter, batch_size, hidden_size)
+        generation_output_nocache = outputs_nocache[iter][inp_seq_len + gen]
         compare(generation_output_cache, generation_output_nocache, atol=1e-5)
-        # compare(o2_uc[64,], o2_c, atol=1e-5)
-        # compare(o3_uc[65,], o3_c, atol=1e-5)
